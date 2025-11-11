@@ -6,14 +6,15 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fs4::FileExt;
 
 const FILE_MAGIC: &[u8; 4] = b"DBL1";
 const FILE_HEADER_LEN: u64 = 8; // 4 magic + 4 version
-const RECORD_HEADER_LEN: u64 = 13; // kind + key len + value len + payload capacity
-const CURRENT_VERSION: u32 = 2;
+const RECORD_HEADER_LEN: u64 = 21; // kind + key len + value len + payload capacity + expiration
+const CURRENT_VERSION: u32 = 3;
 const ALLOCATION_GRANULARITY: u32 = 64;
 
 /// Represents a contiguous value payload written in the backing file.
@@ -27,6 +28,14 @@ pub struct ValueLocation {
     pub record_offset: u64,
     /// Bytes reserved (after the header) for key/value data, aligned for reuse.
     pub record_capacity: u32,
+    /// Optional UNIX timestamp in milliseconds when the key should expire.
+    pub expires_at: Option<u64>,
+}
+
+impl ValueLocation {
+    fn is_expired(&self, now: u64) -> bool {
+        matches!(self.expires_at, Some(exp) if exp <= now)
+    }
 }
 
 /// Basic key/value pair where the value is arbitrary bytes.
@@ -213,21 +222,37 @@ impl KeyValueStore {
         self.metadata.version
     }
 
-    pub fn contains_key(&self, key: &str) -> bool {
-        self.metadata.index.get(key).is_some()
+    pub fn contains_key(&mut self, key: &str) -> io::Result<bool> {
+        if self.evict_if_expired(key)? {
+            return Ok(false);
+        }
+        Ok(self.metadata.index.get(key).is_some())
     }
 
     pub fn put(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
+        self.put_with_ttl(key, value, None)
+    }
+
+    pub fn put_with_ttl(
+        &mut self,
+        key: &str,
+        value: &[u8],
+        ttl: Option<Duration>,
+    ) -> io::Result<()> {
         self.ensure_writable()?;
+        let expires_at = ttl_to_deadline(ttl)?;
         if let Some(previous) = self.metadata.index.get(key).cloned() {
             self.free_list.add(previous);
         }
-        let location = self.persist_record(RecordKind::Insert, key, Some(value))?;
+        let location = self.persist_record(RecordKind::Insert, key, Some(value), expires_at)?;
         let _ = self.metadata.index.insert(key.to_string(), location);
         Ok(())
     }
 
     pub fn get(&mut self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        if self.evict_if_expired(key)? {
+            return Ok(None);
+        }
         let location = match self.metadata.index.get(key) {
             Some(loc) => *loc,
             None => return Ok(None),
@@ -241,6 +266,9 @@ impl KeyValueStore {
 
     pub fn remove(&mut self, key: &str) -> io::Result<bool> {
         self.ensure_writable()?;
+        if self.evict_if_expired(key)? {
+            return Ok(false);
+        }
         let removed = match self.metadata.index.remove(key) {
             Some(loc) => {
                 self.free_list.add(loc);
@@ -251,12 +279,13 @@ impl KeyValueStore {
         if !removed {
             return Ok(false);
         }
-        self.persist_record(RecordKind::Delete, key, None)?;
+        self.persist_record(RecordKind::Delete, key, None, None)?;
         Ok(true)
     }
 
-    pub fn keys(&self) -> impl Iterator<Item = &String> + '_ {
-        self.metadata.index.entries.keys()
+    pub fn keys(&mut self) -> io::Result<Vec<String>> {
+        self.evict_all_expired()?;
+        Ok(self.metadata.index.entries.keys().cloned().collect())
     }
 
     fn ensure_writable(&self) -> io::Result<()> {
@@ -269,11 +298,51 @@ impl KeyValueStore {
         Ok(())
     }
 
+    fn evict_if_expired(&mut self, key: &str) -> io::Result<bool> {
+        let expires_at = match self.metadata.index.get(key) {
+            Some(loc) => match loc.expires_at {
+                Some(ts) => ts,
+                None => return Ok(false),
+            },
+            None => return Ok(false),
+        };
+        let now = current_unix_millis()?;
+        if now < expires_at {
+            return Ok(false);
+        }
+        if let Some(loc) = self.metadata.index.remove(key) {
+            self.free_list.add(loc);
+        }
+        Ok(true)
+    }
+
+    fn evict_all_expired(&mut self) -> io::Result<()> {
+        if self.metadata.index.entries.is_empty() {
+            return Ok(());
+        }
+        let now = current_unix_millis()?;
+        let expired_keys: Vec<String> = self
+            .metadata
+            .index
+            .entries
+            .iter()
+            .filter(|(_, loc)| loc.is_expired(now))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired_keys {
+            if let Some(loc) = self.metadata.index.remove(&key) {
+                self.free_list.add(loc);
+            }
+        }
+        Ok(())
+    }
+
     fn persist_record(
         &mut self,
         kind: RecordKind,
         key: &str,
         value: Option<&[u8]>,
+        expires_at: Option<u64>,
     ) -> io::Result<ValueLocation> {
         let key_bytes = key.as_bytes();
         let value_bytes = value.unwrap_or(&[]);
@@ -281,6 +350,12 @@ impl KeyValueStore {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
                 "delete records cannot carry values",
+            ));
+        }
+        if matches!(kind, RecordKind::Delete) && expires_at.is_some() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "delete records cannot specify expirations",
             ));
         }
         let key_len = u32::try_from(key_bytes.len())
@@ -294,7 +369,15 @@ impl KeyValueStore {
         let aligned_len = align_payload(payload_len)?;
         let allow_reuse = matches!(kind, RecordKind::Insert);
         let region = self.allocate_region(aligned_len, allow_reuse)?;
-        self.write_region(region, kind, key_bytes, value_bytes, key_len, value_len)
+        self.write_region(
+            region,
+            kind,
+            key_bytes,
+            value_bytes,
+            key_len,
+            value_len,
+            expires_at,
+        )
     }
 
     fn allocate_region(
@@ -328,6 +411,7 @@ impl KeyValueStore {
         value_bytes: &[u8],
         key_len: u32,
         value_len: u32,
+        expires_at: Option<u64>,
     ) -> io::Result<ValueLocation> {
         let payload_len = key_len
             .checked_add(value_len)
@@ -347,6 +431,7 @@ impl KeyValueStore {
         header[1..5].copy_from_slice(&key_len.to_le_bytes());
         header[5..9].copy_from_slice(&value_len.to_le_bytes());
         header[9..13].copy_from_slice(&region.payload_capacity.to_le_bytes());
+        header[13..21].copy_from_slice(&encode_expiration(expires_at).to_le_bytes());
         file.write_all(&header)?;
         file.write_all(key_bytes)?;
         if kind == RecordKind::Insert {
@@ -371,6 +456,7 @@ impl KeyValueStore {
             value_length: value_len,
             record_offset: region.offset,
             record_capacity: region.payload_capacity,
+            expires_at,
         })
     }
 
@@ -385,6 +471,7 @@ impl KeyValueStore {
                 "file shorter than header",
             ));
         }
+        let now_snapshot = current_unix_millis()?;
 
         let mut cursor = FILE_HEADER_LEN;
         while cursor < file_len {
@@ -434,9 +521,14 @@ impl KeyValueStore {
                         value_length: header.value_len,
                         record_offset: record_start,
                         record_capacity: payload_capacity,
+                        expires_at: header.expires_at,
                     };
-                    if let Some(previous) = self.metadata.index.insert(key, location) {
-                        self.free_list.add(previous);
+                    if location.is_expired(now_snapshot) {
+                        self.free_list.add(location);
+                    } else {
+                        if let Some(previous) = self.metadata.index.insert(key, location) {
+                            self.free_list.add(previous);
+                        }
                     }
                 }
                 RecordKind::Delete => {
@@ -488,6 +580,7 @@ struct RecordHeader {
     key_len: u32,
     value_len: u32,
     payload_capacity: u32,
+    expires_at: Option<u64>,
 }
 
 fn read_record_header(file: &mut File) -> io::Result<RecordHeader> {
@@ -497,11 +590,13 @@ fn read_record_header(file: &mut File) -> io::Result<RecordHeader> {
     let key_len = u32::from_le_bytes(buf[1..5].try_into().unwrap());
     let value_len = u32::from_le_bytes(buf[5..9].try_into().unwrap());
     let payload_capacity = u32::from_le_bytes(buf[9..13].try_into().unwrap());
+    let expires_raw = u64::from_le_bytes(buf[13..21].try_into().unwrap());
     Ok(RecordHeader {
         kind,
         key_len,
         value_len,
         payload_capacity,
+        expires_at: decode_expiration(expires_raw),
     })
 }
 
@@ -526,7 +621,14 @@ fn ensure_header(file: &mut File) -> io::Result<u32> {
     }
     let mut version_bytes = [0u8; 4];
     file.read_exact(&mut version_bytes)?;
-    Ok(u32::from_le_bytes(version_bytes))
+    let version = u32::from_le_bytes(version_bytes);
+    if version != CURRENT_VERSION {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unsupported file version {version}; expected {CURRENT_VERSION}",),
+        ));
+    }
+    Ok(version)
 }
 
 fn align_payload(len: u32) -> io::Result<u32> {
@@ -563,10 +665,46 @@ fn write_padding(file: &mut File, mut padding: u32, append: bool) -> io::Result<
     Ok(())
 }
 
+fn encode_expiration(expires_at: Option<u64>) -> u64 {
+    expires_at.unwrap_or(0)
+}
+
+fn decode_expiration(raw: u64) -> Option<u64> {
+    if raw == 0 { None } else { Some(raw) }
+}
+
+fn system_time_to_unix_millis(time: SystemTime) -> io::Result<u64> {
+    let duration = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| io::Error::new(ErrorKind::InvalidInput, err))?;
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "timestamp exceeds u64::MAX milliseconds",
+        )
+    })
+}
+
+fn current_unix_millis() -> io::Result<u64> {
+    system_time_to_unix_millis(SystemTime::now())
+}
+
+fn ttl_to_deadline(ttl: Option<Duration>) -> io::Result<Option<u64>> {
+    match ttl {
+        Some(duration) => {
+            let expires_at = SystemTime::now()
+                .checked_add(duration)
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "ttl overflow"))?;
+            Ok(Some(system_time_to_unix_millis(expires_at)?))
+        }
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{fs, thread, time::Duration};
     use tempfile::NamedTempFile;
 
     fn new_store(path: &Path) -> io::Result<KeyValueStore> {
@@ -607,7 +745,7 @@ mod tests {
         let mut store = new_store(file.path())?;
         store.put("fruit", b"apple")?;
         assert!(store.remove("fruit")?);
-        assert!(!store.contains_key("fruit"));
+        assert!(!store.contains_key("fruit")?);
         assert!(store.get("fruit")?.is_none());
         assert!(!store.remove("fruit")?);
         Ok(())
@@ -656,6 +794,31 @@ mod tests {
 
         assert_eq!(len_after_remove, len_after_reuse, "expected block reuse");
         assert_eq!(store.get("beta")?.as_deref(), Some(&smaller_value[..]));
+        Ok(())
+    }
+
+    #[test]
+    fn ttl_expiration_removes_key() -> io::Result<()> {
+        let file = NamedTempFile::new()?;
+        let mut store = new_store(file.path())?;
+        store.put_with_ttl("temp", b"data", Some(Duration::from_millis(50)))?;
+        thread::sleep(Duration::from_millis(70));
+        assert!(store.get("temp")?.is_none());
+        assert!(!store.contains_key("temp")?);
+        Ok(())
+    }
+
+    #[test]
+    fn ttl_expiration_persists_across_restart() -> io::Result<()> {
+        let file = NamedTempFile::new()?;
+        {
+            let mut store = new_store(file.path())?;
+            store.put_with_ttl("session", b"token", Some(Duration::from_millis(50)))?;
+        }
+        thread::sleep(Duration::from_millis(70));
+        let mut reopened = new_store(file.path())?;
+        assert!(reopened.get("session")?.is_none());
+        assert!(!reopened.contains_key("session")?);
         Ok(())
     }
 }
