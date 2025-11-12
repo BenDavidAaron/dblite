@@ -58,7 +58,7 @@ enum ControlFlow {
 }
 
 fn handle_command(store: &mut KeyValueStore, input: &str) -> io::Result<ControlFlow> {
-    let tokens: Vec<&str> = input.split_whitespace().collect();
+    let tokens = tokenize(input)?;
     if tokens.is_empty() {
         return Ok(ControlFlow::Continue);
     }
@@ -69,7 +69,7 @@ fn handle_command(store: &mut KeyValueStore, input: &str) -> io::Result<ControlF
                 println!("Usage: GET <key>");
                 return Ok(ControlFlow::Continue);
             }
-            let key = tokens[1];
+            let key = &tokens[1];
             match store.get(key)? {
                 Some(value) => println!("{}", format_value(&value)),
                 None => println!("(nil)"),
@@ -80,10 +80,10 @@ fn handle_command(store: &mut KeyValueStore, input: &str) -> io::Result<ControlF
                 println!("Usage: SET <key> <value> [ttl_secs]");
                 return Ok(ControlFlow::Continue);
             }
-            let key = tokens[1];
+            let key = &tokens[1];
             let value = tokens[2].as_bytes();
             let ttl = if tokens.len() == 4 {
-                Some(parse_ttl(tokens[3])?)
+                Some(parse_ttl(&tokens[3])?)
             } else {
                 None
             };
@@ -95,7 +95,7 @@ fn handle_command(store: &mut KeyValueStore, input: &str) -> io::Result<ControlF
                 println!("Usage: DEL <key>");
                 return Ok(ControlFlow::Continue);
             }
-            let key = tokens[1];
+            let key = &tokens[1];
             if store.remove(key)? {
                 println!("(deleted)");
             } else {
@@ -112,6 +112,77 @@ fn parse_ttl(raw: &str) -> io::Result<Duration> {
     let secs =
         u64::from_str(raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     Ok(Duration::from_secs(secs))
+}
+
+fn tokenize(input: &str) -> io::Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes: Option<char> = None;
+    let mut escape = false;
+
+    for ch in input.chars() {
+        if escape {
+            current.push(decode_escape(ch)?);
+            escape = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escape = true;
+            continue;
+        }
+
+        if let Some(quote) = in_quotes {
+            if ch == quote {
+                in_quotes = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => {
+                in_quotes = Some(ch);
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if let Some(_) = in_quotes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unterminated quote in command",
+        ));
+    }
+    if escape {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dangling escape in command",
+        ));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+fn decode_escape(ch: char) -> io::Result<char> {
+    Ok(match ch {
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        '0' => '\0',
+        '\\' => '\\',
+        '"' => '"',
+        '\'' => '\'',
+        other => other,
+    })
 }
 
 fn format_value(value: &[u8]) -> String {
@@ -156,6 +227,36 @@ mod cli_tests {
         std::thread::sleep(Duration::from_millis(1100));
         handle_command(&mut store, "GET temp")?;
         assert!(store.get("temp")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cli_set_with_quoted_value() -> io::Result<()> {
+        let file = NamedTempFile::new()?;
+        let mut store = KeyValueStore::open(file.path(), LockMode::Exclusive)?;
+
+        handle_command(&mut store, "SET greeting \"hello world\"")?;
+        assert_eq!(store.get("greeting")?.as_deref(), Some(&b"hello world"[..]));
+
+        handle_command(&mut store, "SET quote \"say \"hi\"\" 1")?;
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(store.get("quote")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cli_supports_single_quotes_and_escapes() -> io::Result<()> {
+        let file = NamedTempFile::new()?;
+        let mut store = KeyValueStore::open(file.path(), LockMode::Exclusive)?;
+
+        handle_command(&mut store, "SET ' spaced key ' 'line 1\\nline 2'")?;
+        assert_eq!(
+            store.get(" spaced key ")?.as_deref(),
+            Some(&b"line 1\nline 2"[..])
+        );
+
+        let tokens = super::tokenize("GET cool\\ key")?;
+        assert_eq!(tokens, vec!["GET".to_string(), "cool key".to_string()]);
         Ok(())
     }
 }
