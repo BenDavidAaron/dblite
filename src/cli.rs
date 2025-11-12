@@ -1,5 +1,5 @@
 use crate::store::KeyValueStore;
-use std::{io, str::FromStr, time::Duration};
+use std::{io, time::Duration};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandResult {
@@ -118,9 +118,12 @@ pub fn tokenize(input: &str) -> io::Result<Vec<String>> {
 }
 
 fn parse_ttl(raw: &str) -> io::Result<Duration> {
-    let secs =
-        u64::from_str(raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    Ok(Duration::from_secs(secs))
+    humantime::parse_duration(raw).or_else(|_| {
+        let secs = raw
+            .parse::<u64>()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        Ok(Duration::from_secs(secs))
+    })
 }
 
 fn decode_escape(ch: char) -> io::Result<char> {
@@ -211,6 +214,17 @@ mod tests {
 
         let tokens = tokenize("GET cool\\ key")?;
         assert_eq!(tokens, vec!["GET".to_string(), "cool key".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn ttl_parser_supports_units() -> io::Result<()> {
+        let file = NamedTempFile::new()?;
+        let mut store = new_store(file.path())?;
+
+        assert_eq!(output(&mut store, "SET foo bar 60s")?, "OK");
+        assert_eq!(output(&mut store, "SET baz qux 1m")?, "OK");
+        assert_eq!(output(&mut store, "SET short ping 2")?, "OK");
         Ok(())
     }
 
