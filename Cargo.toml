@@ -3,6 +3,10 @@ name = "dblite"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+cli = ["dep:rustyline"]
+
 [lib]
 name = "dblite"
 path = "src/lib.rs"
@@ -10,11 +14,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "dblite"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 fs4 = "0.7"
 humantime = "2"
-rustyline = "12"
+rustyline = { version = "12", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
