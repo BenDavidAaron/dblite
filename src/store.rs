@@ -400,15 +400,7 @@ impl KeyValueStore {
         let aligned_len = align_payload(payload_len)?;
         let allow_reuse = matches!(kind, RecordKind::Insert);
         let region = self.allocate_region(aligned_len, allow_reuse)?;
-        self.write_region(
-            region,
-            kind,
-            key_bytes,
-            value_bytes,
-            key_len,
-            value_len,
-            expires_at,
-        )
+        self.write_region(region, kind, key_bytes, value_bytes, expires_at)
     }
 
     fn allocate_region(
@@ -440,10 +432,13 @@ impl KeyValueStore {
         kind: RecordKind,
         key_bytes: &[u8],
         value_bytes: &[u8],
-        key_len: u32,
-        value_len: u32,
         expires_at: Option<u64>,
     ) -> io::Result<ValueLocation> {
+        let key_len = u32::try_from(key_bytes.len())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "key length exceeds u32::MAX"))?;
+        let value_len = u32::try_from(value_bytes.len()).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidInput, "value length exceeds u32::MAX")
+        })?;
         let payload_len = key_len
             .checked_add(value_len)
             .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "record payload too large"))?;
@@ -579,10 +574,8 @@ impl KeyValueStore {
                     };
                     if location.is_expired(now_snapshot) {
                         self.free_list.add(location);
-                    } else {
-                        if let Some(previous) = self.metadata.index.insert(key, location) {
-                            self.free_list.add(previous);
-                        }
+                    } else if let Some(previous) = self.metadata.index.insert(key, location) {
+                        self.free_list.add(previous);
                     }
                 }
                 RecordKind::Delete => {
