@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     convert::TryFrom,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -222,6 +222,10 @@ impl KeyValueStore {
         self.metadata.version
     }
 
+    pub fn path(&self) -> &Path {
+        &self.metadata.path
+    }
+
     pub fn contains_key(&mut self, key: &str) -> io::Result<bool> {
         if self.evict_if_expired(key)? {
             return Ok(false);
@@ -230,7 +234,7 @@ impl KeyValueStore {
     }
 
     pub fn put(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
-        self.put_with_ttl(key, value, None)
+        self.put_with_deadline(key, value, None)
     }
 
     pub fn put_with_ttl(
@@ -239,14 +243,8 @@ impl KeyValueStore {
         value: &[u8],
         ttl: Option<Duration>,
     ) -> io::Result<()> {
-        self.ensure_writable()?;
         let expires_at = ttl_to_deadline(ttl)?;
-        if let Some(previous) = self.metadata.index.get(key).cloned() {
-            self.free_list.add(previous);
-        }
-        let location = self.persist_record(RecordKind::Insert, key, Some(value), expires_at)?;
-        let _ = self.metadata.index.insert(key.to_string(), location);
-        Ok(())
+        self.put_with_deadline(key, value, expires_at)
     }
 
     pub fn get(&mut self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -257,11 +255,7 @@ impl KeyValueStore {
             Some(loc) => *loc,
             None => return Ok(None),
         };
-        let file = self.metadata.lock.file_mut();
-        file.seek(SeekFrom::Start(location.value_offset))?;
-        let mut buf = vec![0u8; location.value_length as usize];
-        file.read_exact(&mut buf)?;
-        Ok(Some(buf))
+        self.read_value_at(location).map(Some)
     }
 
     pub fn remove(&mut self, key: &str) -> io::Result<bool> {
@@ -286,6 +280,43 @@ impl KeyValueStore {
     pub fn keys(&mut self) -> io::Result<Vec<String>> {
         self.evict_all_expired()?;
         Ok(self.metadata.index.entries.keys().cloned().collect())
+    }
+
+    pub fn compact(&mut self) -> io::Result<()> {
+        self.ensure_writable()?;
+        self.evict_all_expired()?;
+        let entries: Vec<(String, ValueLocation)> = self
+            .metadata
+            .index
+            .entries
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+
+        let temp_path = compaction_path(&self.metadata.path);
+        if temp_path.exists() {
+            fs::remove_file(&temp_path)?;
+        }
+
+        {
+            let mut compacted = KeyValueStore::open(&temp_path, LockMode::Exclusive)?;
+            for (key, location) in &entries {
+                let value = self.read_value_at(*location)?;
+                compacted.put_with_deadline(key, &value, location.expires_at)?;
+            }
+        }
+
+        {
+            let mut source = File::open(&temp_path)?;
+            let dest = self.metadata.lock.file_mut();
+            dest.set_len(0)?;
+            dest.seek(SeekFrom::Start(0))?;
+            io::copy(&mut source, dest)?;
+            dest.flush()?;
+        }
+
+        fs::remove_file(&temp_path)?;
+        self.rebuild_index()
     }
 
     fn ensure_writable(&self) -> io::Result<()> {
@@ -458,6 +489,29 @@ impl KeyValueStore {
             record_capacity: region.payload_capacity,
             expires_at,
         })
+    }
+
+    fn read_value_at(&mut self, location: ValueLocation) -> io::Result<Vec<u8>> {
+        let file = self.metadata.lock.file_mut();
+        file.seek(SeekFrom::Start(location.value_offset))?;
+        let mut buf = vec![0u8; location.value_length as usize];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn put_with_deadline(
+        &mut self,
+        key: &str,
+        value: &[u8],
+        expires_at: Option<u64>,
+    ) -> io::Result<()> {
+        self.ensure_writable()?;
+        if let Some(previous) = self.metadata.index.get(key).cloned() {
+            self.free_list.add(previous);
+        }
+        let location = self.persist_record(RecordKind::Insert, key, Some(value), expires_at)?;
+        let _ = self.metadata.index.insert(key.to_string(), location);
+        Ok(())
     }
 
     fn rebuild_index(&mut self) -> io::Result<()> {
@@ -673,6 +727,17 @@ fn decode_expiration(raw: u64) -> Option<u64> {
     if raw == 0 { None } else { Some(raw) }
 }
 
+fn compaction_path(path: &Path) -> PathBuf {
+    let mut scratch = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| format!("{name}.compact"))
+        .unwrap_or_else(|| "dblite.compact".to_string());
+    scratch.set_file_name(file_name);
+    scratch
+}
+
 fn system_time_to_unix_millis(time: SystemTime) -> io::Result<u64> {
     let duration = time
         .duration_since(UNIX_EPOCH)
@@ -704,7 +769,12 @@ fn ttl_to_deadline(ttl: Option<Duration>) -> io::Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, thread, time::Duration};
+    use std::{
+        fs,
+        sync::{Arc, Barrier, mpsc},
+        thread,
+        time::{Duration, Instant},
+    };
     use tempfile::NamedTempFile;
 
     fn new_store(path: &Path) -> io::Result<KeyValueStore> {
@@ -819,6 +889,57 @@ mod tests {
         let mut reopened = new_store(file.path())?;
         assert!(reopened.get("session")?.is_none());
         assert!(!reopened.contains_key("session")?);
+        Ok(())
+    }
+
+    #[test]
+    fn manual_compaction_rewrites_file() -> io::Result<()> {
+        let file = NamedTempFile::new()?;
+        let mut store = new_store(file.path())?;
+        store.put("keep", b"alive")?;
+        store.put("drop", b"dead")?;
+        let before = fs::metadata(file.path())?.len();
+        store.remove("drop")?;
+        store.compact()?;
+        let after = fs::metadata(file.path())?.len();
+        assert!(after <= before, "compaction should not grow file");
+        assert_eq!(store.get("keep")?.as_deref(), Some(&b"alive"[..]));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_writers_respect_os_lock() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("db.dblite");
+        let primary = KeyValueStore::open(&path, LockMode::Exclusive)?;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel();
+        let path_clone = path.clone();
+        let barrier_clone = barrier.clone();
+
+        let handle = thread::spawn(move || -> io::Result<()> {
+            barrier_clone.wait();
+            let start = Instant::now();
+            let _secondary = KeyValueStore::open(&path_clone, LockMode::Exclusive)?;
+            tx.send(start.elapsed()).expect("channel send failed");
+            Ok(())
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(150));
+        drop(primary);
+
+        let delay = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("secondary did not report lock timing");
+        assert!(
+            delay >= Duration::from_millis(100),
+            "secondary writer acquired lock too early: {:?}",
+            delay
+        );
+
+        handle.join().expect("secondary panicked")?;
         Ok(())
     }
 }

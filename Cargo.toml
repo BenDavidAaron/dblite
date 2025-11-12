@@ -3,6 +3,14 @@ name = "dblite"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "dblite"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dblite"
+path = "src/main.rs"
+
 [dependencies]
 fs4 = "0.7"
 
