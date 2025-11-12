@@ -83,4 +83,8 @@ impl Database {
     pub fn execute_command(&mut self, command: &str) -> io::Result<CommandResult> {
         crate::cli::execute_command(&mut self.store, command)
     }
+
+    pub fn keys(&mut self) -> io::Result<Vec<String>> {
+        self.store.keys()
+    }
 }
