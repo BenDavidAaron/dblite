@@ -3,6 +3,7 @@ name = "dblite"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
+description = "A lightweight, embeddable Key/Value store. Inspired by SQLite. Vibe coded over a holiday."
 
 [features]
 default = []
