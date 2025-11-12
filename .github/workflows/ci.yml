@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Cargo fmt (check)
+        run: cargo fmt --all -- --check
+      - name: Cargo check
+        run: cargo check
+      - name: Cargo clippy
+        run: cargo clippy --all-targets --all-features
+      - name: Cargo build (library)
+        run: cargo build
+      - name: Cargo build (CLI feature)
+        run: cargo build --features cli --bin dblite

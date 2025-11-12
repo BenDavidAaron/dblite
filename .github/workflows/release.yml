@@ -1,0 +1,26 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build CLI (release)
+        run: cargo build --release --features cli --bin dblite
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/dblite dist/dblite-linux-amd64
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/dblite-linux-amd64
