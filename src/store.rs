@@ -2,7 +2,6 @@
 
 use std::{
     collections::BTreeMap,
-    convert::TryFrom,
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -176,18 +175,193 @@ impl FileLock {
     }
 }
 
-/// Metadata tracked for each data file managed by the store.
-#[derive(Debug)]
-pub struct FileMetadata {
-    pub path: PathBuf,
-    pub version: u32,
-    pub lock: FileLock,
-    pub index: InMemoryIndex,
+#[derive(Debug, Clone, Copy)]
+struct FileHeader {
+    version: u32,
 }
 
-impl FileMetadata {
-    fn ensure_header(&mut self) -> io::Result<()> {
-        self.version = ensure_header(self.lock.file_mut())?;
+impl FileHeader {
+    fn ensure(file: &mut File) -> io::Result<Self> {
+        let len = file.metadata()?.len();
+        if len < FILE_HEADER_LEN {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(FILE_MAGIC)?;
+            file.write_all(&CURRENT_VERSION.to_le_bytes())?;
+            file.flush()?;
+            return Ok(Self {
+                version: CURRENT_VERSION,
+            });
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)?;
+        if &magic != FILE_MAGIC {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "file magic mismatch",
+            ));
+        }
+        let mut version_bytes = [0u8; 4];
+        file.read_exact(&mut version_bytes)?;
+        let version = u32::from_le_bytes(version_bytes);
+        if version != CURRENT_VERSION {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unsupported file version {version}; expected {CURRENT_VERSION}"),
+            ));
+        }
+        Ok(Self { version })
+    }
+
+    fn version(&self) -> u32 {
+        self.version
+    }
+}
+
+#[derive(Debug)]
+struct StoreFile {
+    path: PathBuf,
+    lock: FileLock,
+    header: FileHeader,
+    index: InMemoryIndex,
+}
+
+impl StoreFile {
+    fn open(path: PathBuf, mode: LockMode) -> io::Result<Self> {
+        let mut lock = FileLock::open(&path, mode)?;
+        let header = FileHeader::ensure(lock.file_mut())?;
+        Ok(Self {
+            path,
+            lock,
+            header,
+            index: InMemoryIndex::default(),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn version(&self) -> u32 {
+        self.header.version()
+    }
+
+    fn lock_mode(&self) -> LockMode {
+        self.lock.mode()
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.lock.file_mut()
+    }
+
+    fn file(&self) -> &File {
+        self.lock.file()
+    }
+
+    fn load_index(&mut self, free_list: &mut FreeList) -> io::Result<()> {
+        self.index.entries.clear();
+        free_list.clear();
+        let file_len = self.file().metadata()?.len();
+        if file_len < FILE_HEADER_LEN {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "file shorter than header",
+            ));
+        }
+        let now_snapshot = current_unix_millis()?;
+
+        let mut cursor = FILE_HEADER_LEN;
+        while cursor < file_len {
+            {
+                let file = self.file_mut();
+                file.seek(SeekFrom::Start(cursor))?;
+            }
+            let header = {
+                let file = self.file_mut();
+                match read_record_header(file) {
+                    Ok(h) => h,
+                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                    Err(err) => return Err(err),
+                }
+            };
+
+            let record_start = cursor;
+            let payload_capacity = header.payload_capacity;
+            let payload_len = header
+                .key_len
+                .checked_add(header.value_len)
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "payload length overflow"))?;
+            if payload_capacity < payload_len {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "payload capacity smaller than data",
+                ));
+            }
+
+            let mut key_buf = vec![0u8; header.key_len as usize];
+            {
+                let file = self.file_mut();
+                file.read_exact(&mut key_buf)?;
+            }
+            let key = String::from_utf8(key_buf).map_err(|_| {
+                io::Error::new(ErrorKind::InvalidData, "stored key is not valid UTF-8")
+            })?;
+
+            let value_offset = {
+                let file = self.file_mut();
+                file.stream_position()?
+            };
+            let value_end = value_offset
+                .checked_add(u64::from(header.value_len))
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "value length overflow"))?;
+            {
+                let file = self.file_mut();
+                file.seek(SeekFrom::Start(value_end))?;
+            }
+            let padding = payload_capacity - payload_len;
+            if padding > 0 {
+                let padding_end = value_end.checked_add(u64::from(padding)).ok_or_else(|| {
+                    io::Error::new(ErrorKind::InvalidData, "padding length overflow")
+                })?;
+                let file = self.file_mut();
+                file.seek(SeekFrom::Start(padding_end))?;
+            }
+
+            match header.kind {
+                RecordKind::Insert => {
+                    let location = ValueLocation {
+                        value_offset,
+                        value_length: header.value_len,
+                        record_offset: record_start,
+                        record_capacity: payload_capacity,
+                        expires_at: header.expires_at,
+                    };
+                    if location.is_expired(now_snapshot) {
+                        free_list.add(location);
+                    } else if let Some(previous) = self.index.insert(key, location) {
+                        free_list.add(previous);
+                    }
+                }
+                RecordKind::Delete => {
+                    if let Some(previous) = self.index.remove(&key) {
+                        free_list.add(previous);
+                    }
+                }
+            }
+
+            let record_end = record_start
+                .checked_add(RECORD_HEADER_LEN)
+                .and_then(|pos| pos.checked_add(u64::from(payload_capacity)))
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "record length overflow"))?;
+            if record_end > file_len {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "record extends beyond end of file",
+                ));
+            }
+            cursor = record_end;
+        }
         Ok(())
     }
 }
@@ -195,23 +369,16 @@ impl FileMetadata {
 /// Main entry point for interacting with the on-disk key/value file.
 #[derive(Debug)]
 pub struct KeyValueStore {
-    metadata: FileMetadata,
+    file: StoreFile,
     free_list: FreeList,
 }
 
 impl KeyValueStore {
     pub fn open(path: impl Into<PathBuf>, mode: LockMode) -> io::Result<Self> {
         let path = path.into();
-        let lock = FileLock::open(&path, mode)?;
-        let mut metadata = FileMetadata {
-            path,
-            version: 0,
-            lock,
-            index: InMemoryIndex::default(),
-        };
-        metadata.ensure_header()?;
+        let file = StoreFile::open(path, mode)?;
         let mut store = Self {
-            metadata,
+            file,
             free_list: FreeList::default(),
         };
         store.rebuild_index()?;
@@ -219,18 +386,18 @@ impl KeyValueStore {
     }
 
     pub fn version(&self) -> u32 {
-        self.metadata.version
+        self.file.version()
     }
 
     pub fn path(&self) -> &Path {
-        &self.metadata.path
+        self.file.path()
     }
 
     pub fn contains_key(&mut self, key: &str) -> io::Result<bool> {
         if self.evict_if_expired(key)? {
             return Ok(false);
         }
-        Ok(self.metadata.index.get(key).is_some())
+        Ok(self.file.index.get(key).is_some())
     }
 
     pub fn put(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
@@ -251,7 +418,7 @@ impl KeyValueStore {
         if self.evict_if_expired(key)? {
             return Ok(None);
         }
-        let location = match self.metadata.index.get(key) {
+        let location = match self.file.index.get(key) {
             Some(loc) => *loc,
             None => return Ok(None),
         };
@@ -263,7 +430,7 @@ impl KeyValueStore {
         if self.evict_if_expired(key)? {
             return Ok(false);
         }
-        let removed = match self.metadata.index.remove(key) {
+        let removed = match self.file.index.remove(key) {
             Some(loc) => {
                 self.free_list.add(loc);
                 true
@@ -279,21 +446,21 @@ impl KeyValueStore {
 
     pub fn keys(&mut self) -> io::Result<Vec<String>> {
         self.evict_all_expired()?;
-        Ok(self.metadata.index.entries.keys().cloned().collect())
+        Ok(self.file.index.entries.keys().cloned().collect())
     }
 
     pub fn compact(&mut self) -> io::Result<()> {
         self.ensure_writable()?;
         self.evict_all_expired()?;
         let entries: Vec<(String, ValueLocation)> = self
-            .metadata
+            .file
             .index
             .entries
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
 
-        let temp_path = compaction_path(&self.metadata.path);
+        let temp_path = compaction_path(self.file.path());
         if temp_path.exists() {
             fs::remove_file(&temp_path)?;
         }
@@ -308,7 +475,7 @@ impl KeyValueStore {
 
         {
             let mut source = File::open(&temp_path)?;
-            let dest = self.metadata.lock.file_mut();
+            let dest = self.file.file_mut();
             dest.set_len(0)?;
             dest.seek(SeekFrom::Start(0))?;
             io::copy(&mut source, dest)?;
@@ -320,7 +487,7 @@ impl KeyValueStore {
     }
 
     fn ensure_writable(&self) -> io::Result<()> {
-        if self.metadata.lock.mode() == LockMode::Shared {
+        if self.file.lock_mode() == LockMode::Shared {
             return Err(io::Error::new(
                 ErrorKind::PermissionDenied,
                 "cannot mutate store opened in shared mode",
@@ -330,7 +497,7 @@ impl KeyValueStore {
     }
 
     fn evict_if_expired(&mut self, key: &str) -> io::Result<bool> {
-        let expires_at = match self.metadata.index.get(key) {
+        let expires_at = match self.file.index.get(key) {
             Some(loc) => match loc.expires_at {
                 Some(ts) => ts,
                 None => return Ok(false),
@@ -341,19 +508,19 @@ impl KeyValueStore {
         if now < expires_at {
             return Ok(false);
         }
-        if let Some(loc) = self.metadata.index.remove(key) {
+        if let Some(loc) = self.file.index.remove(key) {
             self.free_list.add(loc);
         }
         Ok(true)
     }
 
     fn evict_all_expired(&mut self) -> io::Result<()> {
-        if self.metadata.index.entries.is_empty() {
+        if self.file.index.entries.is_empty() {
             return Ok(());
         }
         let now = current_unix_millis()?;
         let expired_keys: Vec<String> = self
-            .metadata
+            .file
             .index
             .entries
             .iter()
@@ -361,7 +528,7 @@ impl KeyValueStore {
             .map(|(key, _)| key.clone())
             .collect();
         for key in expired_keys {
-            if let Some(loc) = self.metadata.index.remove(&key) {
+            if let Some(loc) = self.file.index.remove(&key) {
                 self.free_list.add(loc);
             }
         }
@@ -417,7 +584,7 @@ impl KeyValueStore {
                 });
             }
         }
-        let file = self.metadata.lock.file_mut();
+        let file = self.file.file_mut();
         let offset = file.seek(SeekFrom::End(0))?;
         Ok(AllocatedRegion {
             offset,
@@ -449,7 +616,7 @@ impl KeyValueStore {
             ));
         }
 
-        let file = self.metadata.lock.file_mut();
+        let file = self.file.file_mut();
         file.seek(SeekFrom::Start(region.offset))?;
 
         let mut header = [0u8; RECORD_HEADER_LEN as usize];
@@ -487,7 +654,7 @@ impl KeyValueStore {
     }
 
     fn read_value_at(&mut self, location: ValueLocation) -> io::Result<Vec<u8>> {
-        let file = self.metadata.lock.file_mut();
+        let file = self.file.file_mut();
         file.seek(SeekFrom::Start(location.value_offset))?;
         let mut buf = vec![0u8; location.value_length as usize];
         file.read_exact(&mut buf)?;
@@ -501,103 +668,16 @@ impl KeyValueStore {
         expires_at: Option<u64>,
     ) -> io::Result<()> {
         self.ensure_writable()?;
-        if let Some(previous) = self.metadata.index.get(key).cloned() {
+        if let Some(previous) = self.file.index.get(key).cloned() {
             self.free_list.add(previous);
         }
         let location = self.persist_record(RecordKind::Insert, key, Some(value), expires_at)?;
-        let _ = self.metadata.index.insert(key.to_string(), location);
+        let _ = self.file.index.insert(key.to_string(), location);
         Ok(())
     }
 
     fn rebuild_index(&mut self) -> io::Result<()> {
-        self.metadata.index.entries.clear();
-        self.free_list.clear();
-        let file = self.metadata.lock.file_mut();
-        let file_len = file.metadata()?.len();
-        if file_len < FILE_HEADER_LEN {
-            return Err(io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "file shorter than header",
-            ));
-        }
-        let now_snapshot = current_unix_millis()?;
-
-        let mut cursor = FILE_HEADER_LEN;
-        while cursor < file_len {
-            file.seek(SeekFrom::Start(cursor))?;
-            let header = match read_record_header(file) {
-                Ok(h) => h,
-                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(err),
-            };
-
-            let record_start = cursor;
-            let payload_capacity = header.payload_capacity;
-            let payload_len = header
-                .key_len
-                .checked_add(header.value_len)
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "payload length overflow"))?;
-            if payload_capacity < payload_len {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "payload capacity smaller than data",
-                ));
-            }
-
-            let mut key_buf = vec![0u8; header.key_len as usize];
-            file.read_exact(&mut key_buf)?;
-            let key = String::from_utf8(key_buf).map_err(|_| {
-                io::Error::new(ErrorKind::InvalidData, "stored key is not valid UTF-8")
-            })?;
-
-            let value_offset = file.stream_position()?;
-            let value_end = value_offset
-                .checked_add(u64::from(header.value_len))
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "value length overflow"))?;
-            file.seek(SeekFrom::Start(value_end))?;
-            let padding = payload_capacity - payload_len;
-            if padding > 0 {
-                let padding_end = value_end.checked_add(u64::from(padding)).ok_or_else(|| {
-                    io::Error::new(ErrorKind::InvalidData, "padding length overflow")
-                })?;
-                file.seek(SeekFrom::Start(padding_end))?;
-            }
-
-            match header.kind {
-                RecordKind::Insert => {
-                    let location = ValueLocation {
-                        value_offset,
-                        value_length: header.value_len,
-                        record_offset: record_start,
-                        record_capacity: payload_capacity,
-                        expires_at: header.expires_at,
-                    };
-                    if location.is_expired(now_snapshot) {
-                        self.free_list.add(location);
-                    } else if let Some(previous) = self.metadata.index.insert(key, location) {
-                        self.free_list.add(previous);
-                    }
-                }
-                RecordKind::Delete => {
-                    if let Some(previous) = self.metadata.index.remove(&key) {
-                        self.free_list.add(previous);
-                    }
-                }
-            }
-
-            let record_end = record_start
-                .checked_add(RECORD_HEADER_LEN)
-                .and_then(|pos| pos.checked_add(u64::from(payload_capacity)))
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "record length overflow"))?;
-            if record_end > file_len {
-                return Err(io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "record extends beyond end of file",
-                ));
-            }
-            cursor = record_end;
-        }
-        Ok(())
+        self.file.load_index(&mut self.free_list)
     }
 }
 
@@ -607,10 +687,8 @@ enum RecordKind {
     Delete = 2,
 }
 
-impl TryFrom<u8> for RecordKind {
-    type Error = io::Error;
-
-    fn try_from(value: u8) -> io::Result<Self> {
+impl RecordKind {
+    fn from_byte(value: u8) -> io::Result<Self> {
         match value {
             1 => Ok(Self::Insert),
             2 => Ok(Self::Delete),
@@ -633,7 +711,7 @@ struct RecordHeader {
 fn read_record_header(file: &mut File) -> io::Result<RecordHeader> {
     let mut buf = [0u8; RECORD_HEADER_LEN as usize];
     file.read_exact(&mut buf)?;
-    let kind = RecordKind::try_from(buf[0])?;
+    let kind = RecordKind::from_byte(buf[0])?;
     let key_len = u32::from_le_bytes(buf[1..5].try_into().unwrap());
     let value_len = u32::from_le_bytes(buf[5..9].try_into().unwrap());
     let payload_capacity = u32::from_le_bytes(buf[9..13].try_into().unwrap());
@@ -645,37 +723,6 @@ fn read_record_header(file: &mut File) -> io::Result<RecordHeader> {
         payload_capacity,
         expires_at: decode_expiration(expires_raw),
     })
-}
-
-fn ensure_header(file: &mut File) -> io::Result<u32> {
-    let len = file.metadata()?.len();
-    if len < FILE_HEADER_LEN {
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(FILE_MAGIC)?;
-        file.write_all(&CURRENT_VERSION.to_le_bytes())?;
-        file.flush()?;
-        return Ok(CURRENT_VERSION);
-    }
-    file.seek(SeekFrom::Start(0))?;
-    let mut magic = [0u8; 4];
-    file.read_exact(&mut magic)?;
-    if &magic != FILE_MAGIC {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "file magic mismatch",
-        ));
-    }
-    let mut version_bytes = [0u8; 4];
-    file.read_exact(&mut version_bytes)?;
-    let version = u32::from_le_bytes(version_bytes);
-    if version != CURRENT_VERSION {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("unsupported file version {version}; expected {CURRENT_VERSION}",),
-        ));
-    }
-    Ok(version)
 }
 
 fn align_payload(len: u32) -> io::Result<u32> {
