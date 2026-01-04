@@ -49,9 +49,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --features cli --bin dblite --target ${{ matrix.target }}
+            cross build --release --bin dblite --target ${{ matrix.target }}
           else
-            cargo build --release --features cli --bin dblite --target ${{ matrix.target }}
+            cargo build --release --bin dblite --target ${{ matrix.target }}
           fi
 
       - name: Package binary

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
 
 jobs:
@@ -19,8 +19,8 @@ jobs:
       - name: Cargo check
         run: cargo check
       - name: Cargo clippy
-        run: cargo clippy --all-targets --all-features
-      - name: Cargo build (library)
+        run: cargo clippy --all-targets
+      - name: Cargo build
         run: cargo build
-      - name: Cargo build (CLI feature)
-        run: cargo build --features cli --bin dblite
+      - name: Cargo test
+        run: cargo test
