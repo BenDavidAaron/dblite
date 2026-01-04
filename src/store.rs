@@ -227,8 +227,23 @@ impl StoreFile {
     }
 
     fn load_index(&mut self) -> io::Result<()> {
+        self.clear_state();
+        let file_len = self.validate_file_size()?;
+        let now = current_unix_millis()?;
+
+        let mut cursor = FILE_HEADER_LEN;
+        while cursor < file_len {
+            cursor = self.process_record(cursor, file_len, now)?;
+        }
+        Ok(())
+    }
+
+    fn clear_state(&mut self) {
         self.index.entries.clear();
         self.free_blocks.clear();
+    }
+
+    fn validate_file_size(&self) -> io::Result<u64> {
         let file_len = self.file().metadata()?.len();
         if file_len < FILE_HEADER_LEN {
             return Err(io::Error::new(
@@ -236,98 +251,106 @@ impl StoreFile {
                 "file shorter than header",
             ));
         }
-        let now_snapshot = current_unix_millis()?;
+        Ok(file_len)
+    }
 
-        let mut cursor = FILE_HEADER_LEN;
-        while cursor < file_len {
-            {
-                let file = self.file_mut();
-                file.seek(SeekFrom::Start(cursor))?;
-            }
-            let header = {
-                let file = self.file_mut();
-                match read_record_header(file) {
-                    Ok(h) => h,
-                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-                    Err(err) => return Err(err),
+    fn process_record(&mut self, cursor: u64, file_len: u64, now: u64) -> io::Result<u64> {
+        self.file_mut().seek(SeekFrom::Start(cursor))?;
+
+        let header = match read_record_header(self.file_mut()) {
+            Ok(h) => h,
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(file_len),
+            Err(err) => return Err(err),
+        };
+
+        self.validate_record_header(&header)?;
+        let key = self.read_record_key(&header)?;
+        let value_offset = self.skip_to_value_end(&header)?;
+
+        let location = ValueLocation {
+            value_offset,
+            value_length: header.value_len,
+            record_offset: cursor,
+            record_capacity: header.payload_capacity,
+            expires_at: header.expires_at,
+        };
+
+        self.apply_record(header.kind, key, location, now);
+
+        let record_end = self.calculate_record_end(cursor, header.payload_capacity)?;
+        self.validate_record_bounds(record_end, file_len)?;
+
+        Ok(record_end)
+    }
+
+    fn validate_record_header(&self, header: &RecordHeader) -> io::Result<()> {
+        let payload_len = header
+            .key_len
+            .checked_add(header.value_len)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "payload length overflow"))?;
+
+        if header.payload_capacity < payload_len {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "payload capacity smaller than data",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_record_key(&mut self, header: &RecordHeader) -> io::Result<String> {
+        let mut key_buf = vec![0u8; header.key_len as usize];
+        self.file_mut().read_exact(&mut key_buf)?;
+        String::from_utf8(key_buf)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "stored key is not valid UTF-8"))
+    }
+
+    fn skip_to_value_end(&mut self, header: &RecordHeader) -> io::Result<u64> {
+        let value_offset = self.file_mut().stream_position()?;
+        let value_end = value_offset
+            .checked_add(u64::from(header.value_len))
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "value length overflow"))?;
+
+        let payload_len = header.key_len + header.value_len;
+        let padding = header.payload_capacity - payload_len;
+        let final_position = value_end
+            .checked_add(u64::from(padding))
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "padding length overflow"))?;
+
+        self.file_mut().seek(SeekFrom::Start(final_position))?;
+        Ok(value_offset)
+    }
+
+    fn apply_record(&mut self, kind: RecordKind, key: String, location: ValueLocation, now: u64) {
+        match kind {
+            RecordKind::Insert => {
+                if location.is_expired(now) {
+                    self.add_free_location(location);
+                } else if let Some(previous) = self.index.insert(key, location) {
+                    self.add_free_location(previous);
                 }
-            };
-
-            let record_start = cursor;
-            let payload_capacity = header.payload_capacity;
-            let payload_len = header
-                .key_len
-                .checked_add(header.value_len)
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "payload length overflow"))?;
-            if payload_capacity < payload_len {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "payload capacity smaller than data",
-                ));
             }
-
-            let mut key_buf = vec![0u8; header.key_len as usize];
-            {
-                let file = self.file_mut();
-                file.read_exact(&mut key_buf)?;
-            }
-            let key = String::from_utf8(key_buf).map_err(|_| {
-                io::Error::new(ErrorKind::InvalidData, "stored key is not valid UTF-8")
-            })?;
-
-            let value_offset = {
-                let file = self.file_mut();
-                file.stream_position()?
-            };
-            let value_end = value_offset
-                .checked_add(u64::from(header.value_len))
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "value length overflow"))?;
-            {
-                let file = self.file_mut();
-                file.seek(SeekFrom::Start(value_end))?;
-            }
-            let padding = payload_capacity - payload_len;
-            if padding > 0 {
-                let padding_end = value_end.checked_add(u64::from(padding)).ok_or_else(|| {
-                    io::Error::new(ErrorKind::InvalidData, "padding length overflow")
-                })?;
-                let file = self.file_mut();
-                file.seek(SeekFrom::Start(padding_end))?;
-            }
-
-            match header.kind {
-                RecordKind::Insert => {
-                    let location = ValueLocation {
-                        value_offset,
-                        value_length: header.value_len,
-                        record_offset: record_start,
-                        record_capacity: payload_capacity,
-                        expires_at: header.expires_at,
-                    };
-                    if location.is_expired(now_snapshot) {
-                        self.add_free_location(location);
-                    } else if let Some(previous) = self.index.insert(key, location) {
-                        self.add_free_location(previous);
-                    }
-                }
-                RecordKind::Delete => {
-                    if let Some(previous) = self.index.remove(&key) {
-                        self.add_free_location(previous);
-                    }
+            RecordKind::Delete => {
+                if let Some(previous) = self.index.remove(&key) {
+                    self.add_free_location(previous);
                 }
             }
+        }
+    }
 
-            let record_end = record_start
-                .checked_add(RECORD_HEADER_LEN)
-                .and_then(|pos| pos.checked_add(u64::from(payload_capacity)))
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "record length overflow"))?;
-            if record_end > file_len {
-                return Err(io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "record extends beyond end of file",
-                ));
-            }
-            cursor = record_end;
+    fn calculate_record_end(&self, record_start: u64, payload_capacity: u32) -> io::Result<u64> {
+        record_start
+            .checked_add(RECORD_HEADER_LEN)
+            .and_then(|pos| pos.checked_add(u64::from(payload_capacity)))
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "record length overflow"))
+    }
+
+    fn validate_record_bounds(&self, record_end: u64, file_len: u64) -> io::Result<()> {
+        if record_end > file_len {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "record extends beyond end of file",
+            ));
         }
         Ok(())
     }
