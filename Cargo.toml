@@ -5,6 +5,10 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "A lightweight, embeddable Key/Value store. Inspired by SQLite. Vibe coded over a holiday."
 
+[features]
+default = ["cli"]
+cli = ["dep:humantime", "dep:rustyline"]
+
 [lib]
 name = "dblite"
 path = "src/lib.rs"
@@ -12,11 +16,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "dblite"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 fs4 = "0.7"
-humantime = "2"
-rustyline = "12"
+humantime = { version = "2", optional = true }
+rustyline = { version = "12", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

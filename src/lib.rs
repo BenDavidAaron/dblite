@@ -29,9 +29,11 @@
 //! # }
 //! ```
 
+#[cfg(feature = "cli")]
 pub mod cli;
 pub mod store;
 
+#[cfg(feature = "cli")]
 pub use crate::cli::CommandResult;
 use std::{
     fs::{self, OpenOptions},
@@ -238,6 +240,7 @@ impl Database {
         self.store.path()
     }
 
+    #[cfg(feature = "cli")]
     pub fn execute_command(&mut self, command: &str) -> io::Result<CommandResult> {
         crate::cli::execute_command(&mut self.store, command)
     }
