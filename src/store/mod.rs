@@ -1,14 +1,27 @@
 #![allow(dead_code)]
 
+mod free_space;
+mod index;
+mod lock;
+mod record;
+mod util;
+
 use std::{
-    collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
-use fs4::FileExt;
+use free_space::FreeSpaceManager;
+use index::{InMemoryIndex, ValueLocation};
+use lock::FileLock;
+use record::{RecordHeader, RecordKind, read_record_header};
+use util::{align_payload, compaction_path, current_unix_millis, ttl_to_deadline, write_padding};
+
+// Re-export public types
+pub use index::{KeyValuePair, ValueLocation as PublicValueLocation};
+pub use lock::LockMode;
 
 const FILE_MAGIC: &[u8; 4] = b"DBL1";
 const FILE_HEADER_LEN: u64 = 8; // 4 magic + 4 version
@@ -16,128 +29,11 @@ const RECORD_HEADER_LEN: u64 = 21; // kind + key len + value len + payload capac
 const CURRENT_VERSION: u32 = 3;
 const ALLOCATION_GRANULARITY: u32 = 64;
 
-/// Represents a contiguous value payload written in the backing file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ValueLocation {
-    /// Byte offset from the beginning of the file where the value is stored.
-    pub value_offset: u64,
-    /// Length of the value in bytes.
-    pub value_length: u32,
-    /// Byte offset of the record header.
-    pub record_offset: u64,
-    /// Bytes reserved (after the header) for key/value data, aligned for reuse.
-    pub record_capacity: u32,
-    /// Optional UNIX timestamp in milliseconds when the key should expire.
-    pub expires_at: Option<u64>,
-}
-
-impl ValueLocation {
-    fn is_expired(&self, now: u64) -> bool {
-        matches!(self.expires_at, Some(exp) if exp <= now)
-    }
-}
-
-/// Basic key/value pair where the value is arbitrary bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyValuePair {
-    pub key: String,
-    pub value: Vec<u8>,
-}
-
-/// In-memory index that maps keys to where their values live on disk.
-#[derive(Debug, Default)]
-pub struct InMemoryIndex {
-    pub entries: BTreeMap<String, ValueLocation>,
-}
-
-impl InMemoryIndex {
-    pub fn insert(&mut self, key: String, location: ValueLocation) -> Option<ValueLocation> {
-        self.entries.insert(key, location)
-    }
-
-    pub fn get(&self, key: &str) -> Option<&ValueLocation> {
-        self.entries.get(key)
-    }
-
-    pub fn remove(&mut self, key: &str) -> Option<ValueLocation> {
-        self.entries.remove(key)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FreeBlock {
-    offset: u64,
-    capacity: u32,
-}
-
 #[derive(Debug)]
 struct AllocatedRegion {
     offset: u64,
     payload_capacity: u32,
     append: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockMode {
-    Shared,
-    Exclusive,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LockStrategy {
-    Blocking,
-    NonBlocking,
-}
-
-/// Captures the OS-level lock that guards the data file.
-#[derive(Debug)]
-pub struct FileLock {
-    file: File,
-    mode: LockMode,
-}
-
-impl FileLock {
-    pub fn open(path: &Path, mode: LockMode) -> io::Result<Self> {
-        Self::open_internal(path, mode, LockStrategy::Blocking)
-    }
-
-    pub fn try_open(path: &Path, mode: LockMode) -> io::Result<Self> {
-        Self::open_internal(path, mode, LockStrategy::NonBlocking)
-    }
-
-    fn open_internal(path: &Path, mode: LockMode, strategy: LockStrategy) -> io::Result<Self> {
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        if matches!(mode, LockMode::Exclusive) {
-            options.create(true);
-        }
-        let file = options.open(path)?;
-        match (mode, strategy) {
-            (LockMode::Shared, LockStrategy::Blocking) => <File as FileExt>::lock_shared(&file)?,
-            (LockMode::Shared, LockStrategy::NonBlocking) => {
-                <File as FileExt>::try_lock_shared(&file)?
-            }
-            (LockMode::Exclusive, LockStrategy::Blocking) => {
-                <File as FileExt>::lock_exclusive(&file)?
-            }
-            (LockMode::Exclusive, LockStrategy::NonBlocking) => {
-                <File as FileExt>::try_lock_exclusive(&file)?
-            }
-        }
-        Ok(Self { file, mode })
-    }
-
-    pub fn mode(&self) -> LockMode {
-        self.mode
-    }
-
-    pub fn file(&self) -> &File {
-        &self.file
-    }
-
-    pub fn file_mut(&mut self) -> &mut File {
-        &mut self.file
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -190,7 +86,7 @@ struct StoreFile {
     lock: FileLock,
     header: FileHeader,
     index: InMemoryIndex,
-    free_blocks: BTreeMap<u32, Vec<FreeBlock>>,
+    free_space: FreeSpaceManager,
 }
 
 impl StoreFile {
@@ -202,7 +98,7 @@ impl StoreFile {
             lock,
             header,
             index: InMemoryIndex::default(),
-            free_blocks: BTreeMap::new(),
+            free_space: FreeSpaceManager::new(),
         })
     }
 
@@ -227,8 +123,23 @@ impl StoreFile {
     }
 
     fn load_index(&mut self) -> io::Result<()> {
+        self.clear_state();
+        let file_len = self.validate_file_size()?;
+        let now = current_unix_millis()?;
+
+        let mut cursor = FILE_HEADER_LEN;
+        while cursor < file_len {
+            cursor = self.process_record(cursor, file_len, now)?;
+        }
+        Ok(())
+    }
+
+    fn clear_state(&mut self) {
         self.index.entries.clear();
-        self.free_blocks.clear();
+        self.free_space.clear();
+    }
+
+    fn validate_file_size(&self) -> io::Result<u64> {
         let file_len = self.file().metadata()?.len();
         if file_len < FILE_HEADER_LEN {
             return Err(io::Error::new(
@@ -236,127 +147,108 @@ impl StoreFile {
                 "file shorter than header",
             ));
         }
-        let now_snapshot = current_unix_millis()?;
+        Ok(file_len)
+    }
 
-        let mut cursor = FILE_HEADER_LEN;
-        while cursor < file_len {
-            {
-                let file = self.file_mut();
-                file.seek(SeekFrom::Start(cursor))?;
-            }
-            let header = {
-                let file = self.file_mut();
-                match read_record_header(file) {
-                    Ok(h) => h,
-                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-                    Err(err) => return Err(err),
-                }
-            };
+    fn process_record(&mut self, cursor: u64, file_len: u64, now: u64) -> io::Result<u64> {
+        self.file_mut().seek(SeekFrom::Start(cursor))?;
 
-            let record_start = cursor;
-            let payload_capacity = header.payload_capacity;
-            let payload_len = header
-                .key_len
-                .checked_add(header.value_len)
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "payload length overflow"))?;
-            if payload_capacity < payload_len {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "payload capacity smaller than data",
-                ));
-            }
+        let header = match read_record_header(self.file_mut()) {
+            Ok(h) => h,
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(file_len),
+            Err(err) => return Err(err),
+        };
 
-            let mut key_buf = vec![0u8; header.key_len as usize];
-            {
-                let file = self.file_mut();
-                file.read_exact(&mut key_buf)?;
-            }
-            let key = String::from_utf8(key_buf).map_err(|_| {
-                io::Error::new(ErrorKind::InvalidData, "stored key is not valid UTF-8")
-            })?;
+        self.validate_record_header(&header)?;
+        let key = self.read_record_key(&header)?;
+        let value_offset = self.skip_to_value_end(&header)?;
 
-            let value_offset = {
-                let file = self.file_mut();
-                file.stream_position()?
-            };
-            let value_end = value_offset
-                .checked_add(u64::from(header.value_len))
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "value length overflow"))?;
-            {
-                let file = self.file_mut();
-                file.seek(SeekFrom::Start(value_end))?;
-            }
-            let padding = payload_capacity - payload_len;
-            if padding > 0 {
-                let padding_end = value_end.checked_add(u64::from(padding)).ok_or_else(|| {
-                    io::Error::new(ErrorKind::InvalidData, "padding length overflow")
-                })?;
-                let file = self.file_mut();
-                file.seek(SeekFrom::Start(padding_end))?;
-            }
+        let location = ValueLocation {
+            value_offset,
+            value_length: header.value_len,
+            record_offset: cursor,
+            record_capacity: header.payload_capacity,
+            expires_at: header.expires_at,
+        };
 
-            match header.kind {
-                RecordKind::Insert => {
-                    let location = ValueLocation {
-                        value_offset,
-                        value_length: header.value_len,
-                        record_offset: record_start,
-                        record_capacity: payload_capacity,
-                        expires_at: header.expires_at,
-                    };
-                    if location.is_expired(now_snapshot) {
-                        self.add_free_location(location);
-                    } else if let Some(previous) = self.index.insert(key, location) {
-                        self.add_free_location(previous);
-                    }
-                }
-                RecordKind::Delete => {
-                    if let Some(previous) = self.index.remove(&key) {
-                        self.add_free_location(previous);
-                    }
-                }
-            }
+        self.apply_record(header.kind, key, location, now);
 
-            let record_end = record_start
-                .checked_add(RECORD_HEADER_LEN)
-                .and_then(|pos| pos.checked_add(u64::from(payload_capacity)))
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "record length overflow"))?;
-            if record_end > file_len {
-                return Err(io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "record extends beyond end of file",
-                ));
-            }
-            cursor = record_end;
+        let record_end = self.calculate_record_end(cursor, header.payload_capacity)?;
+        self.validate_record_bounds(record_end, file_len)?;
+
+        Ok(record_end)
+    }
+
+    fn validate_record_header(&self, header: &RecordHeader) -> io::Result<()> {
+        let payload_len = header
+            .key_len
+            .checked_add(header.value_len)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "payload length overflow"))?;
+
+        if header.payload_capacity < payload_len {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "payload capacity smaller than data",
+            ));
         }
         Ok(())
     }
 
-    fn add_free_location(&mut self, location: ValueLocation) {
-        if location.record_capacity == 0 {
-            return;
-        }
-        let entry = self
-            .free_blocks
-            .entry(location.record_capacity)
-            .or_default();
-        entry.push(FreeBlock {
-            offset: location.record_offset,
-            capacity: location.record_capacity,
-        });
+    fn read_record_key(&mut self, header: &RecordHeader) -> io::Result<String> {
+        let mut key_buf = vec![0u8; header.key_len as usize];
+        self.file_mut().read_exact(&mut key_buf)?;
+        String::from_utf8(key_buf)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "stored key is not valid UTF-8"))
     }
 
-    fn take_free_block(&mut self, required_payload: u32) -> Option<FreeBlock> {
-        let key = {
-            let mut iter = self.free_blocks.range(required_payload..);
-            iter.next().map(|(size, _)| *size)?
-        };
-        let mut blocks = self.free_blocks.remove(&key)?;
-        let block = blocks.pop()?;
-        if !blocks.is_empty() {
-            self.free_blocks.insert(key, blocks);
+    fn skip_to_value_end(&mut self, header: &RecordHeader) -> io::Result<u64> {
+        let value_offset = self.file_mut().stream_position()?;
+        let value_end = value_offset
+            .checked_add(u64::from(header.value_len))
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "value length overflow"))?;
+
+        let payload_len = header.key_len + header.value_len;
+        let padding = header.payload_capacity - payload_len;
+        let final_position = value_end
+            .checked_add(u64::from(padding))
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "padding length overflow"))?;
+
+        self.file_mut().seek(SeekFrom::Start(final_position))?;
+        Ok(value_offset)
+    }
+
+    fn apply_record(&mut self, kind: RecordKind, key: String, location: ValueLocation, now: u64) {
+        match kind {
+            RecordKind::Insert => {
+                if location.is_expired(now) {
+                    self.free_space.add(location);
+                } else if let Some(previous) = self.index.insert(key, location) {
+                    self.free_space.add(previous);
+                }
+            }
+            RecordKind::Delete => {
+                if let Some(previous) = self.index.remove(&key) {
+                    self.free_space.add(previous);
+                }
+            }
         }
-        Some(block)
+    }
+
+    fn calculate_record_end(&self, record_start: u64, payload_capacity: u32) -> io::Result<u64> {
+        record_start
+            .checked_add(RECORD_HEADER_LEN)
+            .and_then(|pos| pos.checked_add(u64::from(payload_capacity)))
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "record length overflow"))
+    }
+
+    fn validate_record_bounds(&self, record_end: u64, file_len: u64) -> io::Result<()> {
+        if record_end > file_len {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "record extends beyond end of file",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -422,7 +314,7 @@ impl KeyValueStore {
         }
         let removed = match self.file.index.remove(key) {
             Some(loc) => {
-                self.file.add_free_location(loc);
+                self.file.free_space.add(loc);
                 true
             }
             None => false,
@@ -499,7 +391,7 @@ impl KeyValueStore {
             return Ok(false);
         }
         if let Some(loc) = self.file.index.remove(key) {
-            self.file.add_free_location(loc);
+            self.file.free_space.add(loc);
         }
         Ok(true)
     }
@@ -519,7 +411,7 @@ impl KeyValueStore {
             .collect();
         for key in expired_keys {
             if let Some(loc) = self.file.index.remove(&key) {
-                self.file.add_free_location(loc);
+                self.file.free_space.add(loc);
             }
         }
         Ok(())
@@ -565,14 +457,12 @@ impl KeyValueStore {
         requested_capacity: u32,
         allow_reuse: bool,
     ) -> io::Result<AllocatedRegion> {
-        if allow_reuse {
-            if let Some(block) = self.file.take_free_block(requested_capacity) {
-                return Ok(AllocatedRegion {
-                    offset: block.offset,
-                    payload_capacity: block.capacity,
-                    append: false,
-                });
-            }
+        if allow_reuse && let Some(block) = self.file.free_space.take(requested_capacity) {
+            return Ok(AllocatedRegion {
+                offset: block.offset,
+                payload_capacity: block.capacity,
+                append: false,
+            });
         }
         let file = self.file.file_mut();
         let offset = file.seek(SeekFrom::End(0))?;
@@ -614,7 +504,7 @@ impl KeyValueStore {
         header[1..5].copy_from_slice(&key_len.to_le_bytes());
         header[5..9].copy_from_slice(&value_len.to_le_bytes());
         header[9..13].copy_from_slice(&region.payload_capacity.to_le_bytes());
-        header[13..21].copy_from_slice(&encode_expiration(expires_at).to_le_bytes());
+        header[13..21].copy_from_slice(&record::encode_expiration(expires_at).to_le_bytes());
         file.write_all(&header)?;
         file.write_all(key_bytes)?;
         if kind == RecordKind::Insert {
@@ -659,7 +549,7 @@ impl KeyValueStore {
     ) -> io::Result<()> {
         self.ensure_writable()?;
         if let Some(previous) = self.file.index.get(key).cloned() {
-            self.file.add_free_location(previous);
+            self.file.free_space.add(previous);
         }
         let location = self.persist_record(RecordKind::Insert, key, Some(value), expires_at)?;
         let _ = self.file.index.insert(key.to_string(), location);
@@ -668,131 +558,6 @@ impl KeyValueStore {
 
     fn rebuild_index(&mut self) -> io::Result<()> {
         self.file.load_index()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecordKind {
-    Insert = 1,
-    Delete = 2,
-}
-
-impl RecordKind {
-    fn from_byte(value: u8) -> io::Result<Self> {
-        match value {
-            1 => Ok(Self::Insert),
-            2 => Ok(Self::Delete),
-            other => Err(io::Error::new(
-                ErrorKind::InvalidData,
-                format!("unknown record kind {other}"),
-            )),
-        }
-    }
-}
-
-struct RecordHeader {
-    kind: RecordKind,
-    key_len: u32,
-    value_len: u32,
-    payload_capacity: u32,
-    expires_at: Option<u64>,
-}
-
-fn read_record_header(file: &mut File) -> io::Result<RecordHeader> {
-    let mut buf = [0u8; RECORD_HEADER_LEN as usize];
-    file.read_exact(&mut buf)?;
-    let kind = RecordKind::from_byte(buf[0])?;
-    let key_len = u32::from_le_bytes(buf[1..5].try_into().unwrap());
-    let value_len = u32::from_le_bytes(buf[5..9].try_into().unwrap());
-    let payload_capacity = u32::from_le_bytes(buf[9..13].try_into().unwrap());
-    let expires_raw = u64::from_le_bytes(buf[13..21].try_into().unwrap());
-    Ok(RecordHeader {
-        kind,
-        key_len,
-        value_len,
-        payload_capacity,
-        expires_at: decode_expiration(expires_raw),
-    })
-}
-
-fn align_payload(len: u32) -> io::Result<u32> {
-    if ALLOCATION_GRANULARITY == 0 || len == 0 {
-        return Ok(len);
-    }
-    let remainder = len % ALLOCATION_GRANULARITY;
-    if remainder == 0 {
-        return Ok(len);
-    }
-    len.checked_add(ALLOCATION_GRANULARITY - remainder)
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "aligned payload exceeds u32::MAX"))
-}
-
-fn write_padding(file: &mut File, mut padding: u32, append: bool) -> io::Result<()> {
-    if padding == 0 {
-        return Ok(());
-    }
-    if !append {
-        let current = file.stream_position()?;
-        let target = current
-            .checked_add(u64::from(padding))
-            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "padding seek overflow"))?;
-        file.seek(SeekFrom::Start(target))?;
-        return Ok(());
-    }
-
-    const ZERO_PAD: [u8; 4096] = [0u8; 4096];
-    while padding > 0 {
-        let chunk = padding.min(ZERO_PAD.len() as u32) as usize;
-        file.write_all(&ZERO_PAD[..chunk])?;
-        padding -= chunk as u32;
-    }
-    Ok(())
-}
-
-fn encode_expiration(expires_at: Option<u64>) -> u64 {
-    expires_at.unwrap_or(0)
-}
-
-fn decode_expiration(raw: u64) -> Option<u64> {
-    if raw == 0 { None } else { Some(raw) }
-}
-
-fn compaction_path(path: &Path) -> PathBuf {
-    let mut scratch = path.to_path_buf();
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|name| format!("{name}.compact"))
-        .unwrap_or_else(|| "dblite.compact".to_string());
-    scratch.set_file_name(file_name);
-    scratch
-}
-
-fn system_time_to_unix_millis(time: SystemTime) -> io::Result<u64> {
-    let duration = time
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| io::Error::new(ErrorKind::InvalidInput, err))?;
-    u64::try_from(duration.as_millis()).map_err(|_| {
-        io::Error::new(
-            ErrorKind::InvalidInput,
-            "timestamp exceeds u64::MAX milliseconds",
-        )
-    })
-}
-
-fn current_unix_millis() -> io::Result<u64> {
-    system_time_to_unix_millis(SystemTime::now())
-}
-
-fn ttl_to_deadline(ttl: Option<Duration>) -> io::Result<Option<u64>> {
-    match ttl {
-        Some(duration) => {
-            let expires_at = SystemTime::now()
-                .checked_add(duration)
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "ttl overflow"))?;
-            Ok(Some(system_time_to_unix_millis(expires_at)?))
-        }
-        None => Ok(None),
     }
 }
 
