@@ -588,14 +588,12 @@ impl KeyValueStore {
         requested_capacity: u32,
         allow_reuse: bool,
     ) -> io::Result<AllocatedRegion> {
-        if allow_reuse {
-            if let Some(block) = self.file.take_free_block(requested_capacity) {
-                return Ok(AllocatedRegion {
-                    offset: block.offset,
-                    payload_capacity: block.capacity,
-                    append: false,
-                });
-            }
+        if allow_reuse && let Some(block) = self.file.take_free_block(requested_capacity) {
+            return Ok(AllocatedRegion {
+                offset: block.offset,
+                payload_capacity: block.capacity,
+                append: false,
+            });
         }
         let file = self.file.file_mut();
         let offset = file.seek(SeekFrom::End(0))?;
