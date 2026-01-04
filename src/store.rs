@@ -70,6 +70,51 @@ struct FreeBlock {
     capacity: u32,
 }
 
+/// Manages free space tracking and allocation within the store file.
+#[derive(Debug, Default)]
+struct FreeSpaceManager {
+    free_blocks: BTreeMap<u32, Vec<FreeBlock>>,
+}
+
+impl FreeSpaceManager {
+    fn new() -> Self {
+        Self {
+            free_blocks: BTreeMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.free_blocks.clear();
+    }
+
+    fn add(&mut self, location: ValueLocation) {
+        if location.record_capacity == 0 {
+            return;
+        }
+        let entry = self
+            .free_blocks
+            .entry(location.record_capacity)
+            .or_default();
+        entry.push(FreeBlock {
+            offset: location.record_offset,
+            capacity: location.record_capacity,
+        });
+    }
+
+    fn take(&mut self, required_payload: u32) -> Option<FreeBlock> {
+        let key = {
+            let mut iter = self.free_blocks.range(required_payload..);
+            iter.next().map(|(size, _)| *size)?
+        };
+        let mut blocks = self.free_blocks.remove(&key)?;
+        let block = blocks.pop()?;
+        if !blocks.is_empty() {
+            self.free_blocks.insert(key, blocks);
+        }
+        Some(block)
+    }
+}
+
 #[derive(Debug)]
 struct AllocatedRegion {
     offset: u64,
@@ -190,7 +235,7 @@ struct StoreFile {
     lock: FileLock,
     header: FileHeader,
     index: InMemoryIndex,
-    free_blocks: BTreeMap<u32, Vec<FreeBlock>>,
+    free_space: FreeSpaceManager,
 }
 
 impl StoreFile {
@@ -202,7 +247,7 @@ impl StoreFile {
             lock,
             header,
             index: InMemoryIndex::default(),
-            free_blocks: BTreeMap::new(),
+            free_space: FreeSpaceManager::new(),
         })
     }
 
@@ -240,7 +285,7 @@ impl StoreFile {
 
     fn clear_state(&mut self) {
         self.index.entries.clear();
-        self.free_blocks.clear();
+        self.free_space.clear();
     }
 
     fn validate_file_size(&self) -> io::Result<u64> {
@@ -325,14 +370,14 @@ impl StoreFile {
         match kind {
             RecordKind::Insert => {
                 if location.is_expired(now) {
-                    self.add_free_location(location);
+                    self.free_space.add(location);
                 } else if let Some(previous) = self.index.insert(key, location) {
-                    self.add_free_location(previous);
+                    self.free_space.add(previous);
                 }
             }
             RecordKind::Delete => {
                 if let Some(previous) = self.index.remove(&key) {
-                    self.add_free_location(previous);
+                    self.free_space.add(previous);
                 }
             }
         }
@@ -353,33 +398,6 @@ impl StoreFile {
             ));
         }
         Ok(())
-    }
-
-    fn add_free_location(&mut self, location: ValueLocation) {
-        if location.record_capacity == 0 {
-            return;
-        }
-        let entry = self
-            .free_blocks
-            .entry(location.record_capacity)
-            .or_default();
-        entry.push(FreeBlock {
-            offset: location.record_offset,
-            capacity: location.record_capacity,
-        });
-    }
-
-    fn take_free_block(&mut self, required_payload: u32) -> Option<FreeBlock> {
-        let key = {
-            let mut iter = self.free_blocks.range(required_payload..);
-            iter.next().map(|(size, _)| *size)?
-        };
-        let mut blocks = self.free_blocks.remove(&key)?;
-        let block = blocks.pop()?;
-        if !blocks.is_empty() {
-            self.free_blocks.insert(key, blocks);
-        }
-        Some(block)
     }
 }
 
@@ -445,7 +463,7 @@ impl KeyValueStore {
         }
         let removed = match self.file.index.remove(key) {
             Some(loc) => {
-                self.file.add_free_location(loc);
+                self.file.free_space.add(loc);
                 true
             }
             None => false,
@@ -522,7 +540,7 @@ impl KeyValueStore {
             return Ok(false);
         }
         if let Some(loc) = self.file.index.remove(key) {
-            self.file.add_free_location(loc);
+            self.file.free_space.add(loc);
         }
         Ok(true)
     }
@@ -542,7 +560,7 @@ impl KeyValueStore {
             .collect();
         for key in expired_keys {
             if let Some(loc) = self.file.index.remove(&key) {
-                self.file.add_free_location(loc);
+                self.file.free_space.add(loc);
             }
         }
         Ok(())
@@ -588,7 +606,7 @@ impl KeyValueStore {
         requested_capacity: u32,
         allow_reuse: bool,
     ) -> io::Result<AllocatedRegion> {
-        if allow_reuse && let Some(block) = self.file.take_free_block(requested_capacity) {
+        if allow_reuse && let Some(block) = self.file.free_space.take(requested_capacity) {
             return Ok(AllocatedRegion {
                 offset: block.offset,
                 payload_capacity: block.capacity,
@@ -680,7 +698,7 @@ impl KeyValueStore {
     ) -> io::Result<()> {
         self.ensure_writable()?;
         if let Some(previous) = self.file.index.get(key).cloned() {
-            self.file.add_free_location(previous);
+            self.file.free_space.add(previous);
         }
         let location = self.persist_record(RecordKind::Insert, key, Some(value), expires_at)?;
         let _ = self.file.index.insert(key.to_string(), location);
