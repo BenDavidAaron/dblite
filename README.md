@@ -106,6 +106,15 @@ Add to your `Cargo.toml`:
 dblite = "0.1"
 ```
 
+**For minimal binary size** (excludes CLI command parser):
+
+```toml
+[dependencies]
+dblite = { version = "0.1", default-features = false }
+```
+
+This reduces the library from ~300KB to ~260KB by removing the CLI module and its dependencies (`rustyline`, `humantime`).
+
 #### Basic Usage
 
 ```rust
@@ -267,7 +276,7 @@ cargo test
 
 ## License
 
-This project is licensed under the **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**.
+This project is licensed under the **MIT License**.
 
 See the LICENSE file for details.
 
