@@ -1,3 +1,4 @@
+use clap::Parser;
 use dblite::{CommandResult, Database};
 use rustyline::{
     Context, Editor, Helper, Result as RustylineResult,
@@ -8,23 +9,37 @@ use rustyline::{
     history::DefaultHistory,
     validate::Validator,
 };
-use std::{env, io, path::PathBuf};
+use std::{io, path::PathBuf};
+
+#[derive(Parser)]
+#[command(name = "dblite")]
+#[command(about = "A lightweight, embeddable Key/Value store", long_about = None)]
+struct Cli {
+    /// Path to the database file
+    path: Option<PathBuf>,
+}
 
 fn main() -> io::Result<()> {
-    let db_path = database_path_from_args();
+    let cli = Cli::parse();
+
+    let db_path = match cli.path {
+        Some(path) => path,
+        None => {
+            eprintln!("Error: Missing required argument <PATH>");
+            eprintln!();
+            eprintln!("Usage: dblite <PATH>");
+            eprintln!();
+            eprintln!("For more information, try '--help'");
+            std::process::exit(1);
+        }
+    };
+
     let mut db = Database::open_or_create(&db_path)?;
     println!(
         "dblite ready at {:?}. Commands: GET <key>, SET <key> <value> [ttl_secs], DEL <key>, COMPACT, EXIT",
         db.path()
     );
     repl(&mut db)
-}
-
-fn database_path_from_args() -> PathBuf {
-    env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("usage: dblite <path-to-db>"))
 }
 
 fn repl(db: &mut Database) -> io::Result<()> {
