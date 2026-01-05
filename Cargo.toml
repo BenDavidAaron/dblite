@@ -1,13 +1,13 @@
 [package]
 name = "dblite"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "A lightweight, embeddable Key/Value store. Inspired by SQLite. Vibe coded over a holiday."
 
 [features]
 default = ["cli"]
-cli = ["dep:humantime", "dep:rustyline"]
+cli = ["dep:clap", "dep:humantime", "dep:rustyline"]
 
 [lib]
 name = "dblite"
@@ -19,6 +19,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"], optional = true }
 fs4 = "0.7"
 humantime = { version = "2", optional = true }
 rustyline = { version = "12", optional = true }
