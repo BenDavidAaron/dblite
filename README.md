@@ -15,6 +15,15 @@ A lightweight, embeddable key-value store inspired by SQLite. Simple, fast, and 
 
 ## Installation
 
+### Via Brew
+
+Install using Homebrew:
+
+```bash
+brew tap BenDavidAaron/dblite
+brew install dblite
+```
+
 ### From Source
 
 ```bash
