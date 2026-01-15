@@ -6,7 +6,28 @@ on:
       - "v*"
 
 jobs:
-  build-and-release:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create source tarball
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          git archive --format=tar.gz --prefix=dblite-${VERSION}/ HEAD > dblite-${VERSION}.tar.gz
+          sha256sum dblite-${VERSION}.tar.gz > dblite-${VERSION}.tar.gz.sha256
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dblite-*.tar.gz
+            dblite-*.tar.gz.sha256
+
+  build-binaries:
+    needs: create-release
     strategy:
       matrix:
         include:
@@ -60,7 +81,7 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.artifact_name }}
 
-      - name: Publish release asset
+      - name: Publish binary asset
         uses: softprops/action-gh-release@v2
         with:
           files: dist/${{ matrix.artifact_name }}
