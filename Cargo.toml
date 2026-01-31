@@ -25,4 +25,5 @@ humantime = { version = "2", optional = true }
 rustyline = { version = "12", optional = true }
 
 [dev-dependencies]
+rand = "0.8"
 tempfile = "3"

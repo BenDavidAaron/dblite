@@ -283,6 +283,32 @@ cargo build --release
 cargo test
 ```
 
+## Stress Testing
+
+The project includes a stress test that exercises random reads, writes, deletes, and compactions against a temporary database, then verifies data integrity. It also produces a CSV report with per-operation timing and throughput data.
+
+### Running the stress test
+
+```bash
+cargo test stress -- --nocapture
+```
+
+By default the test runs 500 operations. Set `STRESS_OPS` to increase the count:
+
+```bash
+STRESS_OPS=10000 cargo test stress -- --nocapture
+```
+
+### CSV report
+
+The test writes a CSV file (default `stress_report.csv` in the working directory). Override the path with `STRESS_REPORT`:
+
+```bash
+STRESS_REPORT=results.csv STRESS_OPS=5000 cargo test stress -- --nocapture
+```
+
+The report includes columns for operation counts, cumulative bytes read/written, per-operation timings in microseconds, file size on disk, and wall-clock elapsed time -- useful for spotting performance regressions or profiling compaction cost.
+
 ## License
 
 This project is licensed under the **MIT License**.
